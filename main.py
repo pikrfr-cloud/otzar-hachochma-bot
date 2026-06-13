@@ -2,6 +2,9 @@ import telebot
 import requests
 import os
 import io
+import time
+import base64
+from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 OTZAR_USERNAME = os.environ.get("OTZAR_USERNAME", "")
@@ -10,100 +13,201 @@ OTZAR_PASSWORD = os.environ.get("OTZAR_PASSWORD", "")
 BASE_URL = "https://tablet.otzar.org"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-session = requests.Session()
 
-def login_to_otzar():
+_pw = None
+_browser = None
+_page = None
+
+def get_page():
+    global _pw, _browser, _page
+    if _page is None:
+        _pw = sync_playwright().start()
+        _browser = _pw.chromium.launch(headless=True)
+        ctx = _browser.new_context()
+        _page = ctx.new_page()
+        _page.goto(f"{BASE_URL}/#/login")
+        _page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(2)
+        inputs = _page.query_selector_all("input")
+        if len(inputs) >= 2:
+            inputs[0].fill(OTZAR_USERNAME)
+            inputs[1].fill(OTZAR_PASSWORD)
+        btns = _page.query_selector_all("button")
+        if btns:
+            btns[0].click()
+        time.sleep(4)
+        print("Logged in to Otzar HaChochma")
+    return _page
+
+
+def search_book(book_name):
+    session = requests.Session()
     resp = session.post(f"{BASE_URL}/api/user/connectUser", json={
         "username": OTZAR_USERNAME,
         "password": OTZAR_PASSWORD
     })
-    return resp.status_code == 200
+    if resp.status_code != 200:
+        return None, "Login failed"
+    resp = session.get(f"{BASE_URL}/api/search/searchBooks", params={
+        "searchStr": book_name,
+        "start": 0,
+        "rows": 10
+    })
+    if resp.status_code != 200:
+        return None, f"Search failed: {resp.status_code}"
+    data = resp.json()
+    books = data.get("books", data.get("results", data.get("docs", [])))
+    if not books:
+        return None, f"No books found for '{book_name}'"
+    book = books[0]
+    book_id = book.get("id", book.get("bookId", book.get("ID")))
+    title = book.get("title", book.get("bookTitle", book_name))
+    return book_id, title
 
-def get_page_image(book_id, page_num):
-    url = f"{BASE_URL}/api/images/{book_id}/P{page_num:04d}?&resize=1000"
-    resp = session.get(url)
+
+def parse_siman(siman_str):
+    hebrew_map = {
+        'א': 1, 'ב': 2, 'ג': 3, 'ד': 4, 'ה': 5,
+        'ו': 6, 'ז': 7, 'ח': 8, 'ט': 9, 'י': 10,
+        'יא': 11, 'יב': 12, 'יג': 13, 'יד': 14, 'טו': 15,
+        'טז': 16, 'יז': 17, 'יח': 18, 'יט': 19, 'כ': 20
+    }
+    s = siman_str.strip()
+    if s in hebrew_map:
+        return hebrew_map[s]
+    try:
+        return int(s)
+    except:
+        return 1
+
+
+def find_siman_pages(book_id, siman_str):
+    session = requests.Session()
+    session.post(f"{BASE_URL}/api/user/connectUser", json={
+        "username": OTZAR_USERNAME,
+        "password": OTZAR_PASSWORD
+    })
+    resp = session.get(f"{BASE_URL}/api/books/getIndex", params={"bookId": book_id})
     if resp.status_code == 200:
-        return resp.content
-    return None
+        try:
+            toc = resp.json()
+            entries = toc.get("index", toc.get("toc", []))
+            if entries:
+                for entry in entries:
+                    label = str(entry.get("label", entry.get("title", "")))
+                    if siman_str in label or str(parse_siman(siman_str)) in label:
+                        sp = entry.get("page", entry.get("pageNum", 1))
+                        return list(range(sp, sp + 3))
+        except:
+            pass
+    siman_num = parse_siman(siman_str)
+    estimated = max(1, siman_num * 2 + 15)
+    return list(range(estimated, estimated + 3))
 
-print("Connecting to Otzar HaChochma...")
-if login_to_otzar():
-    print("Login successful!")
-else:
-    print("Login failed - check credentials")
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message,
-        "📚 ברוך הבא לבוט אוצר החכמה!\n\n"
-        "פקודות זמינות:\n"
-        "/download <ספר_מספר> <עמוד_התחלה>-<עמוד_סוף>\n"
-        "דוגמה: /download 169125 1-5\n\n"
-        "/search <מילה>\n"
-        "דוגמה: /search שבת")
+def capture_page(book_id, page_num):
+    page = get_page()
+    url = f"{BASE_URL}/#/b/{book_id}/p/{page_num}/t/0/fs/0/start/0/end/0/c"
+    print(f"Loading: {url}")
+    page.goto(url)
+    try:
+        page.wait_for_selector(".img-canvas, canvas", timeout=20000)
+        time.sleep(3)
+    except:
+        time.sleep(6)
+    canvas_data = page.evaluate("""() => {
+        const canvas = document.querySelector('.img-canvas') || document.querySelector('canvas');
+        if (canvas && canvas.width > 10) {
+            return canvas.toDataURL('image/jpeg', 0.85);
+        }
+        return null;
+    }""")
+    if canvas_data and "data:image" in str(canvas_data):
+        b64 = canvas_data.split(",")[1]
+        return base64.b64decode(b64)
+    # Fallback: screenshot
+    return page.screenshot()
+
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "שלום! אני בוט אוצר החכמה.\n\nפקודות:\n/get <שם ספר> <ציון>\n/download <book_id> <עמוד_התחלה>-<עמוד_סוף>\n/search <מילה>")
+
+
+@bot.message_handler(commands=['get'])
+def get_siman(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "שימוש: /get <שם ספר> <ציון>\nדוגמה: /get תשובות הרמבם ז")
+        return
+    args = parts[1].strip()
+    tokens = args.split()
+    siman = tokens[-1]
+    book_name = " ".join(tokens[:-1])
+    bot.reply_to(message, f"מחפש '{book_name}'...")
+    book_id, title = search_book(book_name)
+    if book_id is None:
+        bot.reply_to(message, f"לא נמצא: {title}")
+        return
+    bot.reply_to(message, f"נמצא: {title} (ID: {book_id})\nמחפש ציון {siman}...")
+    pages = find_siman_pages(book_id, siman)
+    bot.reply_to(message, f"מוריד עמודים {pages[0]}-{pages[-1]}...")
+    sent = 0
+    for p in pages:
+        try:
+            data = capture_page(book_id, p)
+            if data and len(data) > 500:
+                buf = io.BytesIO(data)
+                buf.name = f"page_{p}.jpg"
+                bot.send_document(message.chat.id, buf, caption=f"עמוד {p}")
+                sent += 1
+            else:
+                bot.send_message(message.chat.id, f"עמוד {p}: תמונה ריקה")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"שגיאה עמוד {p}: {str(e)[:120]}")
+    bot.send_message(message.chat.id, f"הסתיים - {sent} עמודים נשלחו")
+
 
 @bot.message_handler(commands=['download'])
 def download_pages(message):
-    try:
-        parts = message.text.split()
-        if len(parts) < 3:
-            bot.reply_to(message, "שימוש: /download <מספר_ספר> <עמוד_התחלה>-<עמוד_סוף>")
-            return
-        book_id = parts[1]
-        pages_range = parts[2].split('-')
-        start_page = int(pages_range[0])
-        end_page = int(pages_range[1]) if len(pages_range) > 1 else start_page
-        if end_page - start_page > 20:
-            bot.reply_to(message, "ניתן להוריד עד 20 עמודים בכל פעם")
-            return
-        bot.reply_to(message, f"מוריד עמודים {start_page}-{end_page} מספר {book_id}...")
-        for page_num in range(start_page, end_page + 1):
-            img_data = get_page_image(book_id, page_num)
-            if img_data:
-                img_file = io.BytesIO(img_data)
-                img_file.name = f"page_{page_num}.jpg"
-                try:
-                    bot.send_photo(message.chat.id, img_file, caption=f"עמוד {page_num}")
-                except Exception:
-                    img_file = io.BytesIO(img_data)
-                    img_file.name = f"page_{page_num}.jpg"
-                    bot.send_document(message.chat.id, img_file, caption=f"עמוד {page_num}")
+    parts = message.text.split()
+    if len(parts) < 3:
+        bot.reply_to(message, "שימוש: /download <book_id> <start>-<end>")
+        return
+    book_id = parts[1]
+    rng = parts[2]
+    if '-' in rng:
+        s, e = rng.split('-')
+        pages = list(range(int(s), int(e) + 1))
+    else:
+        pages = [int(rng)]
+    bot.reply_to(message, f"מוריד עמודים {pages[0]}-{pages[-1]} מספר {book_id}...")
+    for p in pages:
+        try:
+            data = capture_page(book_id, p)
+            if data and len(data) > 500:
+                buf = io.BytesIO(data)
+                buf.name = f"page_{p}.jpg"
+                bot.send_document(message.chat.id, buf, caption=f"עמוד {p}")
             else:
-                bot.send_message(message.chat.id, f"לא נמצא עמוד {page_num}")
-    except Exception as e:
-        bot.reply_to(message, f"שגיאה: {str(e)}")
+                bot.send_message(message.chat.id, f"עמוד {p}: לא ניתן להוריד")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"שגיאה עמוד {p}: {str(e)[:120]}")
+
 
 @bot.message_handler(commands=['search'])
-def search_otzar(message):
-    try:
-        query = message.text.replace('/search', '').strip()
-        if not query:
-            bot.reply_to(message, "שימוש: /search <מילה>")
-            return
-        bot.reply_to(message, f"מחפש: {query}...")
-        resp = session.post(f"{BASE_URL}/api/freesearch/coords", json={
-            "words": query,
-            "books": [],
-            "start": 0,
-            "rows": 10
-        })
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get('docs', [])
-            if results:
-                reply = f"נמצאו {len(results)} תוצאות עבור '{query}':\n\n"
-                for i, r in enumerate(results[:5], 1):
-                    title = r.get('title', 'ללא שם')
-                    book_id = r.get('bookId', '')
-                    page = r.get('page', '')
-                    reply += f"{i}. {title}\n   ספר: {book_id}, עמוד: {page}\n\n"
-                bot.reply_to(message, reply)
-            else:
-                bot.reply_to(message, f"לא נמצאו תוצאות עבור '{query}'")
-        else:
-            bot.reply_to(message, "שגיאה בחיפוש")
-    except Exception as e:
-        bot.reply_to(message, f"שגיאה: {str(e)}")
+def search_cmd(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "שימוש: /search <מילה>")
+        return
+    query = parts[1]
+    book_id, title = search_book(query)
+    if book_id:
+        bot.reply_to(message, f"נמצא: {title}\nID: {book_id}\nלהורדה: /download {book_id} 1-3")
+    else:
+        bot.reply_to(message, f"לא נמצא: {query}")
 
-print("Bot is running...")
+
+print("Bot starting with Playwright support...")
 bot.polling(none_stop=True)
