@@ -60,6 +60,54 @@ def get_page():
 
 
 def search_book(book_name):
+    """Search for a book by name using the Playwright browser search."""
+    page = get_page()
+    try:
+        # Navigate to home/search page
+        page.goto(f"{BASE_URL}/#/", timeout=20000)
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(1)
+        
+        # Find search input and type the book name
+        search_inputs = page.query_selector_all("input[type='text'], input[placeholder*='חיפוש'], input[placeholder*='search'], .search-input, input.search")
+        
+        if not search_inputs:
+            # Try finding any visible input
+            search_inputs = page.query_selector_all("input")
+        
+        if search_inputs:
+            search_inputs[0].fill(book_name)
+            search_inputs[0].press("Enter")
+            time.sleep(3)
+        
+        # Try to get search results from the page
+        # Look for book items in the results
+        book_items = page.query_selector_all(".book-item, .book-title, [class*='book'], .result-item, li[class*='book']")
+        
+        if book_items:
+            # Get the first result's book ID
+            first_item = book_items[0]
+            href = first_item.get_attribute("href") or first_item.evaluate("el => el.querySelector('a') ? el.querySelector('a').href : ''")
+            # Extract book ID from URL pattern /#/b/{id}/
+            import re
+            match = re.search(r'/#/b/(d+)/', href or '')
+            if match:
+                book_id = int(match.group(1))
+                title = first_item.inner_text()[:50]
+                return book_id, title
+        
+        # Fallback: try to find by navigating and checking URL changes
+        # or use the known books list
+        return None, f"ספר '{book_name}' לא נמצא"
+        
+    except Exception as e:
+        print(f"Search error: {e}")
+        # Try requests-based search as fallback
+        return search_book_api(book_name)
+
+
+def search_book_api(book_name):
+    """Search for a book using requests with local filtering."""
     session = requests.Session()
     resp = session.post(f"{BASE_URL}/api/user/connectUser", json={
         "username": OTZAR_USERNAME,
@@ -67,21 +115,33 @@ def search_book(book_name):
     })
     if resp.status_code != 200:
         return None, "Login failed"
-    resp = session.get(f"{BASE_URL}/api/search/searchBooks", params={
-        "searchStr": book_name,
-        "start": 0,
-        "rows": 10
-    })
+    
+    # Get the books list and filter locally
+    # Since there are 163k books, we use the addnames search
+    # The book data endpoint returns books with their addnames
+    # Try to get the first 1000 books and filter
+    resp = session.get(f"{BASE_URL}/api/books")
     if resp.status_code != 200:
-        return None, f"Search failed: {resp.status_code}"
-    data = resp.json()
-    books = data.get("books", data.get("results", data.get("docs", [])))
-    if not books:
-        return None, f"No books found for '{book_name}'"
-    book = books[0]
-    book_id = book.get("id", book.get("bookId", book.get("ID")))
-    title = book.get("title", book.get("bookTitle", book_name))
-    return book_id, title
+        return None, f"Failed to get books: {resp.status_code}"
+    
+    try:
+        books = resp.json()
+        # Filter by name or addnames
+        search_lower = book_name.lower()
+        for book in books[:5000]:  # Check first 5000 only
+            name = book.get('name', '').lower()
+            if search_lower in name:
+                book_id = book.get('id')
+                return book_id, book.get('name', book_name)
+            # Check addnames
+            for addname in book.get('addnames', []):
+                if search_lower in addname.get('name', '').lower():
+                    book_id = book.get('id')
+                    return book_id, book.get('name', book_name)
+    except Exception as e:
+        print(f"API search error: {e}")
+    
+    return None, f"ספר '{book_name}' לא נמצא"
 
 
 def parse_siman(siman_str):
