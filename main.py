@@ -4,6 +4,25 @@ import os
 import io
 import time
 import base64
+import subprocess
+import sys
+
+# Install playwright chromium at startup if not available
+def ensure_playwright():
+    try:
+        result = subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium", "--with-deps"],
+            capture_output=True, text=True, timeout=300
+        )
+        print("Playwright install:", result.stdout[-500:] if result.stdout else "done")
+        if result.returncode != 0:
+            print("Playwright install stderr:", result.stderr[-300:])
+    except Exception as e:
+        print(f"Playwright install error: {e}")
+
+print("Installing Playwright Chromium...")
+ensure_playwright()
+
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -12,7 +31,7 @@ OTZAR_PASSWORD = os.environ.get("OTZAR_PASSWORD", "")
 
 BASE_URL = "https://tablet.otzar.org"
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
 _pw = None
 _browser = None
@@ -22,11 +41,11 @@ def get_page():
     global _pw, _browser, _page
     if _page is None:
         _pw = sync_playwright().start()
-        _browser = _pw.chromium.launch(headless=True)
+        _browser = _pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = _browser.new_context()
         _page = ctx.new_page()
         _page.goto(f"{BASE_URL}/#/login")
-        _page.wait_for_load_state("networkidle", timeout=15000)
+        _page.wait_for_load_state("networkidle", timeout=20000)
         time.sleep(2)
         inputs = _page.query_selector_all("input")
         if len(inputs) >= 2:
@@ -125,7 +144,6 @@ def capture_page(book_id, page_num):
     if canvas_data and "data:image" in str(canvas_data):
         b64 = canvas_data.split(",")[1]
         return base64.b64decode(b64)
-    # Fallback: screenshot
     return page.screenshot()
 
 
@@ -210,4 +228,4 @@ def search_cmd(message):
 
 
 print("Bot starting with Playwright support...")
-bot.polling(none_stop=True)
+bot.infinity_polling(timeout=10, long_polling_timeout=5)
