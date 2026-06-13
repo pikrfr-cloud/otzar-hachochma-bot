@@ -1,6 +1,7 @@
 import telebot
 import requests
 import os
+import io
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 OTZAR_USERNAME = os.environ.get("OTZAR_USERNAME", "")
@@ -59,7 +60,14 @@ def download_pages(message):
         for page_num in range(start_page, end_page + 1):
             img_data = get_page_image(book_id, page_num)
             if img_data:
-                bot.send_photo(message.chat.id, img_data, caption=f"עמוד {page_num}")
+                img_file = io.BytesIO(img_data)
+                img_file.name = f"page_{page_num}.jpg"
+                try:
+                    bot.send_photo(message.chat.id, img_file, caption=f"עמוד {page_num}")
+                except Exception:
+                    img_file = io.BytesIO(img_data)
+                    img_file.name = f"page_{page_num}.jpg"
+                    bot.send_document(message.chat.id, img_file, caption=f"עמוד {page_num}")
             else:
                 bot.send_message(message.chat.id, f"לא נמצא עמוד {page_num}")
     except Exception as e:
